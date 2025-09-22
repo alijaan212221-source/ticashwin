@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<script>
+		// User system with localStorage sync for admin panel
+		let isLoggedIn = false;
+		let currentUser = '';
+		let currentReferralCode = '';
+		let userDB = {};
+		function loadUserDB() {
+			try { userDB = JSON.parse(localStorage.getItem('userDB')) || {}; } catch(e) { userDB = {}; }
+		}
+		function saveUserDB() {
+			localStorage.setItem('userDB', JSON.stringify(userDB));
+		}
+		loadUserDB();
+		function showAuthModal(type) {
+			loadUserDB();
+			// If user already registered, always show login
+			const userInput = document.getElementById('auth-username');
+			if (userInput) {
+				const userVal = userInput.value.trim();
+				if (userVal && userDB[userVal]) type = 'login';
+			}
+			document.getElementById('auth-modal').style.display = 'block';
+			document.getElementById('auth-type').innerText = type === 'login' ? 'Login' : 'Register';
+			document.getElementById('auth-action').innerText = type === 'login' ? 'Login' : 'Register';
+			document.getElementById('auth-action').onclick = type === 'login' ? doLogin : doRegister;
+			if (document.getElementById('auth-phone')) document.getElementById('auth-phone').style.display = type === 'register' ? 'block' : 'none';
+		}
+		function closeAuthModal() {
+			document.getElementById('auth-modal').style.display = 'none';
+		}
+		function doLogin() {
+			loadUserDB();
+			const user = document.getElementById('auth-username').value.trim();
+			const pass = document.getElementById('auth-password').value.trim();
+			if (!user || !pass) { alert('Please enter username and password.'); return; }
+			if (!userDB[user]) { alert('User not found. Please register.'); return; }
+			if (userDB[user].pass !== pass) { alert('Incorrect password.'); return; }
+			isLoggedIn = true;
+			currentUser = user;
+			currentReferralCode = userDB[user].referralCode;
+			walletBalance = userDB[user].wallet || 0;
+			userPlan = userDB[user].plan || null;
+			closeAuthModal();
+				updateAuthUI();
+				// If user is logged in and has already bound account, keep fields disabled after refresh
+				if (isLoggedIn && userDB[currentUser] && userDB[currentUser].boundAccount) {
+					setTimeout(() => {
+						if (document.getElementById('withdraw-method')) document.getElementById('withdraw-method').disabled = true;
+						if (document.getElementById('withdraw-name')) document.getElementById('withdraw-name').disabled = true;
+						if (document.getElementById('withdraw-number')) document.getElementById('withdraw-number').disabled = true;
+						if (document.getElementById('bind-btn')) document.getElementById('bind-btn').disabled = true;
+					}, 200);
+					isAccountBound = true;
+				}
+		}
+		function doRegister() {
+    loadUserDB();
+    const user = document.getElementById('auth-username').value.trim();
+    const phone = document.getElementById('auth-phone') ? document.getElementById('auth-phone').value.trim() : '';
+    const pass = document.getElementById('auth-password').value.trim();
+    let referredBy = '';
+    const refInput = document.getElementById('auth-referral');
+    if (refInput && refInput.value.trim()) {
+        for (let uname in userDB) {
+            if (userDB[uname].referralCode === refInput.value.trim()) {
+                referredBy = refInput.value.trim();
+                break;
+            }
+        }
+    }
+    if (!user || !pass || !phone) { alert('Please enter username, phone number, and password.'); return; }
+    if (!/^\d{11}$/.test(phone)) { alert('Please enter a valid 11 digit phone number.'); return; }
+    for (let uname in userDB) {
+        if (userDB[uname].phone === phone) {
+            alert('This phone number is already registered.');
+            return;
+        }
+    }
+    if (userDB[user]) { alert('Username already exists.'); return; }
+    let code = (user.slice(0,3) + Math.random().toString(36).substr(2,3)).toUpperCase();
+    userDB[user] = { phone, pass, referralCode: code, referredBy, wallet: 0, plan: null, deposits: [], withdrawals: [], tasks: [] };
+    saveUserDB();
+    // Save credentials for auto-login
+    localStorage.setItem('autoUser', user);
+    localStorage.setItem('autoPass', pass);
+    isLoggedIn = true;
+    currentUser = user;
+    currentReferralCode = code;
+    walletBalance = 0;
+    userPlan = null;
+    closeAuthModal();
+    updateAuthUI();
+}
+		function doLogout() {
+			isLoggedIn = false;
+			currentUser = '';
+			currentReferralCode = '';
+			walletBalance = 0;
+			userPlan = null;
+			// Remove auto-login credentials
+			localStorage.removeItem('autoUser');
+			localStorage.removeItem('autoPass');
+			updateAuthUI();
+		}
+		function updateAuthUI() {
+			document.getElementById('auth-user').innerText = isLoggedIn ? 'Welcome, ' + currentUser : '';
+			document.getElementById('login-btn').style.display = isLoggedIn ? 'none' : 'inline-block';
+			document.getElementById('register-btn').style.display = isLoggedIn ? 'none' : 'inline-block';
+			document.getElementById('logout-btn').style.display = isLoggedIn ? 'inline-block' : 'none';
+			document.getElementById('main-content').style.display = isLoggedIn ? 'block' : 'none';
+			document.getElementById('not-logged-in').style.display = isLoggedIn ? 'none' : 'block';
+			updateReferralLink();
+			updateWalletBalanceDisplay();
+			updateTaskSection();
+			updateFriendsSection();
+			updatePlansSection();
+		}
+		function getReferralLink() {
+    if (!isLoggedIn || !currentUser) return 'Please login to get your referral link.';
+    return 'https://cashwin.com/referral/' + encodeURIComponent(currentUser.toLowerCase());
+}
+		function updateReferralLink() {
+			const input = document.getElementById('referral-link');
+			if (!input) return;
+			input.value = getReferralLink();
+		}
+		async function copyReferral() {
+			const input = document.getElementById('referral-link');
+			if (!input) return;
+			await navigator.clipboard.writeText(input.value);
+			alert('Referral link copied!');
+		}
+		// Wallet and plan system
+		let walletBalance = 0;
+		let userPlan = null;
+		const planEarnings = { 600: 30, 1200: 60, 2400: 120, 4500: 225 };
+		const planTaskTaps = { 600: 50, 1200: 100, 2400: 200, 4500: 400 };
+		let currentTaskTaps = 0;
+		function joinPlan(amount) {
+			if (walletBalance < amount) {
+				alert('Insufficient wallet balance to join this plan!');
+				return;
+			}
+			// Prevent buying same or lower plan
+			if (userPlan && amount <= userPlan) {
+				alert('You already have this plan or a higher plan. Upgrade to a higher plan only.');
+				return;
+			}
+			// Refund previous plan if upgrading
+			if (userPlan && amount > userPlan) {
+				walletBalance += userPlan;
+				alert('Previous plan amount (' + userPlan + ' PKR) refunded!');
+			}
+			walletBalance -= amount;
+			userPlan = amount;
+			if (isLoggedIn && userDB[currentUser]) {
+				userDB[currentUser].wallet = walletBalance;
+				userDB[currentUser].plan = amount;
+				saveUserDB();
+				// Distribute referral bonus
+				distributeReferralBonus(currentUser, amount);
+			}
+			updateWalletBalanceDisplay();
+			alert('You have joined the ' + amount + ' PKR plan!');
+			updateTaskSection();
+			updatePlansSection();
+		}
+		function updateTaskSection() {
+    const taskSection = document.getElementById('tasks-content');
+    if (!userPlan) {
+        taskSection.innerHTML = '<p style="color:#b71c1c; font-weight:bold;">You have not joined any plan yet. Please join a plan to unlock daily tasks.</p>';
+        return;
+    }
+    // Check if today's task is already completed
+    let lastTaskDate = null;
+    if (isLoggedIn && userDB[currentUser] && userDB[currentUser].tasks.length) {
+        lastTaskDate = userDB[currentUser].tasks[userDB[currentUser].tasks.length-1].date;
+    }
+    let today = new Date().toISOString().slice(0,10);
+    let alreadyDone = lastTaskDate && lastTaskDate.slice(0,10) === today;
+    // Reset tap count if new day
+    if (!alreadyDone) currentTaskTaps = 0;
+    const earning = planEarnings[userPlan] || 0;
+    const requiredTaps = planTaskTaps[userPlan] || 0;
+    taskSection.innerHTML = `
+        <div style="font-size:1.2rem; color:#009688; font-weight:bold; margin-bottom:1rem;">Your Plan: ${userPlan} PKR</div>
+        <div style="margin-bottom:1.2rem;">Complete your daily task to earn <b>${earning} PKR</b> today!</div>
+        <div id='tap-task-area' style='margin-bottom:1.2rem;'>
+            <div id='tap-circle' onclick='${alreadyDone?'':"tapTask()"}' style='width:100px;height:100px;border-radius:50%;background:${alreadyDone?'#bdbdbd':'#7ed957'};display:flex;align-items:center;justify-content:center;font-size:2rem;color:#fff;cursor:${alreadyDone?'not-allowed':'pointer'};margin:0 auto 0.7rem auto;user-select:none;'>${alreadyDone?'Done':'Tap'}</div>
+            <div id='tap-progress' style='font-size:1.1rem;color:#2d3e50;'>${alreadyDone?requiredTaps:currentTaskTaps} / ${requiredTaps} taps</div>
+        </div>
+        <button class="wallet-btn" id="complete-task-btn" onclick="completeTask()" ${alreadyDone?'disabled':''}>Complete Task</button>
+        ${alreadyDone?'<div style="color:#b71c1c; margin-top:0.7rem;">You have already completed today\'s task.</div>':''}
+    `;
+}
+		function tapTask() {
+			if (!userPlan) return;
+			const requiredTaps = planTaskTaps[userPlan] || 0;
+			currentTaskTaps++;
+			document.getElementById('tap-progress').innerText = `${currentTaskTaps} / ${requiredTaps} taps`;
+			if (currentTaskTaps >= requiredTaps) {
+				document.getElementById('complete-task-btn').disabled = false;
+				document.getElementById('tap-circle').style.background = '#4caf50';
+				document.getElementById('tap-circle').innerText = 'Done';
+				document.getElementById('tap-circle').style.cursor = 'default';
+				document.getElementById('tap-circle').onclick = null;
+			}
+		}
+		function completeTask() {
+			if (!userPlan) return;
+			// Check if already done today
+			let lastTaskDate = null;
+			if (isLoggedIn && userDB[currentUser] && userDB[currentUser].tasks.length) {
+				lastTaskDate = userDB[currentUser].tasks[userDB[currentUser].tasks.length-1].date;
+			}
+			let today = new Date().toISOString().slice(0,10);
+			if (lastTaskDate && lastTaskDate.slice(0,10) === today) {
+				alert('You have already completed today\'s task.');
+				return;
+			}
+			const earning = planEarnings[userPlan] || 0;
+			const requiredTaps = planTaskTaps[userPlan] || 0;
+			if (currentTaskTaps < requiredTaps) {
+				alert('Please complete the tap task first!');
+				return;
+			}
+			walletBalance += earning;
+			if (isLoggedIn && userDB[currentUser]) {
+				userDB[currentUser].wallet = walletBalance;
+				userDB[currentUser].tasks.push({ earning, date: new Date().toISOString() });
+				saveUserDB();
+			}
+			updateWalletBalanceDisplay();
+			alert('Task completed! ' + earning + ' PKR added to your wallet.');
+			updateTaskSection();
+		}
+		function updateWalletBalanceDisplay() {
+			document.getElementById('wallet-balance').innerText = walletBalance + ' PKR';
+		}
+		function submitEasypaisa() {
+			const tid = document.getElementById('ep-tid').value;
+			const amount = parseInt(document.getElementById('ep-deposit-amount').value);
+			if (tid.length !== 11) {
+				alert('Please enter a valid 11 digit TID for Easypaisa.');
+				return;
+			}
+			if (isLoggedIn && userDB[currentUser]) {
+				userDB[currentUser].deposits.push({ method: 'Easypaisa', tid, amount, date: new Date().toISOString(), status: 'pending' });
+				saveUserDB();
+			}
+			alert('Easypaisa deposit request submitted! Awaiting admin approval.');
+			updateWalletBalanceDisplay();
+		}
+		function submitJazzcash() {
+			const tid = document.getElementById('jc-tid').value;
+			const amount = parseInt(document.getElementById('jc-deposit-amount').value);
+			if (tid.length !== 12) {
+				alert('Please enter a valid 12 digit TID for JazzCash.');
+				return;
+			}
+			if (isLoggedIn && userDB[currentUser]) {
+				userDB[currentUser].deposits.push({ method: 'JazzCash', tid, amount, date: new Date().toISOString(), status: 'pending' });
+				saveUserDB();
+			}
+			alert('JazzCash deposit request submitted! Awaiting admin approval.');
+			updateWalletBalanceDisplay();
+		}
+		function submitWithdraw() {
+				if (!isAccountBound) {
+					alert('Please bind your account first.');
+					return;
+				}
+				const amount = parseInt(document.getElementById('withdraw-amount').value);
+				if (walletBalance < amount) {
+					alert('Insufficient balance!');
+					return;
+				}
+				walletBalance -= amount;
+				if (isLoggedIn && userDB[currentUser]) {
+					userDB[currentUser].wallet = walletBalance;
+					userDB[currentUser].withdrawals.push({ amount, date: new Date().toISOString(), status: 'pending' });
+					saveUserDB();
+				}
+				alert('Withdrawal request submitted! Awaiting admin approval.');
+				updateWalletBalanceDisplay();
+		}
+		// Withdrawal/account binding
+		let isAccountBound = false;
+		function bindAccount() {
+			const method = document.getElementById('withdraw-method').value;
+			const name = document.getElementById('withdraw-name').value.trim();
+			const number = document.getElementById('withdraw-number').value.trim();
+			if (!name || !number || (number.length !== 11)) {
+				alert('Please enter a valid account name and 11 digit number.');
+				return;
+			}
+			loadUserDB();
+					// Prevent rebinding for this user only
+					if (isLoggedIn && userDB[currentUser] && userDB[currentUser].boundAccount) {
+						alert('You have already bound your withdrawal account. It cannot be changed.');
+						// Also keep fields disabled
+						if (document.getElementById('withdraw-method')) document.getElementById('withdraw-method').disabled = true;
+						if (document.getElementById('withdraw-name')) document.getElementById('withdraw-name').disabled = true;
+						if (document.getElementById('withdraw-number')) document.getElementById('withdraw-number').disabled = true;
+						if (document.getElementById('bind-btn')) document.getElementById('bind-btn').disabled = true;
+						isAccountBound = true;
+						return;
+					}
+				// Check if this account is already bound to another user
+				for (let uname in userDB) {
+					if (uname !== currentUser && userDB[uname].boundAccount && userDB[uname].boundAccount.name === name && userDB[uname].boundAccount.number === number) {
+						alert('This account is already bound to another user.');
+						return;
+					}
+				}
+			// Save binding in userDB
+			if (isLoggedIn && userDB[currentUser]) {
+				userDB[currentUser].boundAccount = { method, name, number };
+				saveUserDB();
+			}
+			document.getElementById('withdraw-method').disabled = true;
+			document.getElementById('withdraw-name').disabled = true;
+			document.getElementById('withdraw-number').disabled = true;
+			document.getElementById('bind-btn').disabled = true;
+			isAccountBound = true;
+			alert('Account successfully bound!');
+		}
+		// Add modal for login/register choice
+		function openAuthFromChoice(type) {
+    document.getElementById('choose-auth-modal').style.display = 'none';
+    showAuthModal(type);
+}
+		window.onload = function() {
+			showSection('home');
+			loadUserDB();
+			// Auto-login if credentials saved
+			// Listen for admin changes in localStorage and auto-refresh user UI
+			window.addEventListener('storage', function(e) {
+			  if (e.key === 'userDB') {
+			    loadUserDB();
+			    if (isLoggedIn && userDB[currentUser]) {
+			      walletBalance = userDB[currentUser].wallet || 0;
+			      userPlan = userDB[currentUser].plan || null;
+			    }
+			    updateAuthUI();
+			  }
+			});
+			const autoUser = localStorage.getItem('autoUser');
+			const autoPass = localStorage.getItem('autoPass');
+			if (autoUser && autoPass && userDB[autoUser] && userDB[autoUser].pass === autoPass) {
+				isLoggedIn = true;
+				currentUser = autoUser;
+				currentReferralCode = userDB[autoUser].referralCode;
+				walletBalance = userDB[autoUser].wallet || 0;
+				userPlan = userDB[autoUser].plan || null;
+			} else if (!isLoggedIn) {
+				document.getElementById('choose-auth-modal').style.display = 'flex';
+			}
+			updateAuthUI();
+		};
+		function getReferredFriends() {
+    loadUserDB();
+    if (!isLoggedIn || !currentUser || !userDB[currentUser]) return [];
+    const myCode = userDB[currentUser].referralCode;
+    return Object.keys(userDB).filter(u => userDB[u].referredBy === myCode);
+}
+function distributeReferralBonus(buyer, planAmount) {
+    loadUserDB();
+    let bonuses = [0.10, 0.05, 0.01]; // A, B, C level
+    let bonusUsers = [];
+    let current = buyer;
+    for (let level = 0; level < 3; level++) {
+        let refCode = userDB[current] && userDB[current].referredBy;
+        if (!refCode) break;
+        // Find user with this referral code
+        let refUser = Object.keys(userDB).find(u => userDB[u].referralCode === refCode);
+        if (!refUser) break;
+        let bonus = Math.floor(planAmount * bonuses[level]);
+        if (!userDB[refUser].refBonus) userDB[refUser].refBonus = 0;
+        userDB[refUser].refBonus += bonus;
+        if (!userDB[refUser].refBonusHistory) userDB[refUser].refBonusHistory = [];
+        userDB[refUser].refBonusHistory.push({from: buyer, amount: bonus, level: level+1, date: new Date().toISOString()});
+        saveUserDB();
+        bonusUsers.push({user: refUser, bonus, level: level+1});
+        current = refUser;
+    }
+    return bonusUsers;
+}
+function updateFriendsSection() {
+    const friendsDiv = document.getElementById('friends');
+    if (!friendsDiv) return;
+    const referred = getReferredFriends();
+    let refLink = getReferralLink();
+    let html = '';
+    if (isLoggedIn) {
+        let refBonus = userDB[currentUser].refBonus || 0;
+        html += `<div style='margin-bottom:1.5rem;'>`;
+        html += `<div style='margin-bottom:0.7rem;'><span style='font-weight:bold; color:#2d3e50;'>Your Referral Code: </span><span id='referral-code' style='font-size:1.1rem; color:#009688; font-weight:bold;'>${userDB[currentUser].referralCode}</span></div>`;
+        html += `<div style='display:flex; align-items:center; gap:0.7rem;'>`;
+        html += `<div style='flex:1; background:#f9fafb; border:1px solid #b0bec5; border-radius:6px; padding:0.7rem; font-size:1rem; overflow-x:auto; word-break:break-all;'>`;
+        html += `<a href='${refLink}' target='_blank' style='color:#009688; text-decoration:underline;'>${refLink}</a>`;
+        html += `</div>`;
+        html += `<button class='wallet-btn' style='background:#009688;' onclick='copyReferral()'>Copy Link</button>`;
+        html += `</div>`;
+        html += `</div>`;
+        html += `<div style='margin:1rem 0; color:#388e3c; font-weight:bold;'>Total Referral Bonus: ${refBonus} PKR</div>`;
+        if (userDB[currentUser].refBonusHistory && userDB[currentUser].refBonusHistory.length) {
+            html += `<div style='margin-bottom:1rem;'><b>Bonus History:</b><ul style='list-style:none; padding:0;'>`;
+            userDB[currentUser].refBonusHistory.slice().reverse().forEach(bh => {
+                html += `<li style='margin-bottom:0.3rem;'>+${bh.amount} PKR from ${bh.from} (Level ${bh.level})</li>`;
+            });
+            html += `</ul></div>`;
+        }
+        // Show A, B, C level friends (clickable)
+        let aLevel = getReferredFriends();
+        let bLevel = [];
+        let cLevel = [];
+        aLevel.forEach(a => {
+            let bFriends = Object.keys(userDB).filter(u => userDB[u].referredBy === userDB[a].referralCode);
+            bLevel.push(...bFriends);
+        });
+        bLevel.forEach(b => {
+            let cFriends = Object.keys(userDB).filter(u => userDB[u].referredBy === userDB[b].referralCode);
+            cLevel.push(...cFriends);
+        });
+        html += `<div style='margin-bottom:0.7rem;'><b><a href='#' style='color:#009688; text-decoration:underline;' onclick='showFriendLevelDetails("A", [${aLevel.map(u=>`"${u}"`).join(',')}]);return false;'>A Level Friends (10%)</a>:</b> ${aLevel.length > 0 ? aLevel.length : 'None'}</div>`;
+        html += `<div style='margin-bottom:0.7rem;'><b><a href='#' style='color:#009688; text-decoration:underline;' onclick='showFriendLevelDetails("B", [${bLevel.map(u=>`"${u}"`).join(',')}]);return false;'>B Level Friends (5%)</a>:</b> ${bLevel.length > 0 ? bLevel.length : 'None'}</div>`;
+        html += `<div style='margin-bottom:1.2rem;'><b><a href='#' style='color:#009688; text-decoration:underline;' onclick='showFriendLevelDetails("C", [${cLevel.map(u=>`"${u}"`).join(',')}]);return false;'>C Level Friends (1%)</a>:</b> ${cLevel.length > 0 ? cLevel.length : 'None'}</div>`;
+        html += `<h2 style='color:#2d3e50; margin-bottom:1.2rem;'>Invite Friends & Earn</h2>`;
+        html += `<p style='font-size:1.1rem; color:#444; max-width:500px; margin:0 auto 1.5rem auto;'>Share your unique referral link with friends. When they join using your link, you both earn rewards!</p>`;
+        html += `<div style='margin-bottom:1rem; color:#388e3c; font-weight:bold;'>Friends Joined: ${referred.length}</div>`;
+        if (referred.length > 0) {
+            html += `<ul style='list-style:none; padding:0; color:#2d3e50;'>`;
+            referred.forEach(f => { html += `<li style='margin-bottom:0.3rem;'>${f}</li>`; });
+            html += `</ul>`;
+        }
+        html += `<img src='https://img.freepik.com/free-vector/refer-friend-concept-illustration_114360-7892.jpg' alt='Refer a Friend' style='max-width:320px; width:100%; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,0.07);'>`;
+    }
+    friendsDiv.innerHTML = html;
+    updateReferralLink();
+}
+		// Add modal for friend details
+		function showFriendLevelDetails(level, users) {
+    loadUserDB();
+    let html = `<h3 style='color:#2d3e50;'>${level} Level Friends</h3>`;
+    if (!users.length) {
+        html += '<div style="color:#888;">No friends at this level.</div>';
+    } else {
+        html += `<table style='width:100%; margin-bottom:1rem;'><tr><th>Username</th><th>Phone</th><th>Plan</th><th>Wallet</th></tr>`;
+        users.forEach(u => {
+            let ud = userDB[u];
+            html += `<tr><td>${u}</td><td>${ud.phone||''}</td><td>${ud.plan||'None'}</td><td>${ud.wallet||0}</td></tr>`;
+        });
+        html += `</table>`;
+    }
+    document.getElementById('friend-details-content').innerHTML = html;
+    document.getElementById('friend-details-modal').style.display = 'flex';
+}
+function closeFriendDetails() {
+    document.getElementById('friend-details-modal').style.display = 'none';
+}
+	</script>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Investment Platform</title>
+	<style>
+		.wallet-options {
+			display: flex;
+			gap: 2.5rem;
+			flex-wrap: wrap;
+			justify-content: center;
+			margin-top: 1.5rem;
+		}
+		.wallet-card {
+			background: linear-gradient(135deg, #f9fafb 80%, #e0f7fa 100%);
+			border-radius: 14px;
+			padding: 2rem 1.5rem 1.5rem 1.5rem;
+			box-shadow: 0 2px 10px rgba(0,0,0,0.07);
+			width: 350px;
+			margin-bottom: 2rem;
+			text-align: center;
+			position: relative;
+		}
+		.wallet-card img.wallet-logo {
+			width: 80px;
+			margin-bottom: 0.7rem;
+			border-radius: 10px;
+			background: #fff;
+			box-shadow: 0 1px 6px rgba(0,0,0,0.08);
+			padding: 0.3rem;
+		}
+		.wallet-card input[type="text"] {
+			width: 95%;
+			padding: 0.6rem;
+			margin: 0.5rem 0 1rem 0;
+			border-radius: 6px;
+			border: 1px solid #b0bec5;
+			font-size: 1.05rem;
+		}
+		.wallet-btn {
+			display: inline-block;
+			margin-top: 0.7rem;
+			padding: 0.6rem 1.5rem;
+			background: #2d3e50;
+			color: #fff;
+			border: none;
+			border-radius: 6px;
+			cursor: pointer;
+			text-decoration: none;
+			font-size: 1.1rem;
+			font-weight: 500;
+			box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+		}
+		.wallet-btn:hover { background: #1a2233; }
+		.wallet-section-title {
+			font-size: 2rem;
+			color: #2d3e50;
+			margin-bottom: 1.2rem;
+			font-weight: bold;
+			letter-spacing: 1px;
+		}
+		.wallet-method {
+			background: #fff;
+			border-radius: 10px;
+			box-shadow: 0 1px 6px rgba(0,0,0,0.06);
+			padding: 1.2rem 1rem 1rem 1rem;
+			margin-bottom: 1.2rem;
+		}
+		.wallet-method-title {
+			font-size: 1.15rem;
+			font-weight: bold;
+			color: #009688;
+			margin-bottom: 0.5rem;
+		}
+		body {
+			font-family: Arial, sans-serif;
+			background: linear-gradient(135deg, #e0eafc 0%, #cfdef3 50%, #f9fafb 100%);
+			min-height: 100vh;
+			margin: 0;
+			padding: 0;
+		}
+		.navbar {
+			background: #2d3e50;
+			color: #fff;
+			padding: 2.5rem 2rem 1.2rem 2rem;
+			display: flex;
+			flex-direction: column;
+			align-items: center;
+		}
+		.navbar h1 {
+			margin: 0 0 1.2rem 0;
+			font-size: 3.2rem;
+			font-weight: bold;
+			background: linear-gradient(90deg, #ff9800, #ff3d00, #00bcd4, #4caf50);
+			-webkit-background-clip: text;
+			-webkit-text-fill-color: transparent;
+			background-clip: text;
+			letter-spacing: 2px;
+			text-align: center;
+		}
+		.nav-links {
+			display: flex;
+			gap: 2.5rem;
+			margin-bottom: 1.5rem;
+		}
+		.nav-links a {
+			color: #fff;
+			text-decoration: none;
+			font-weight: bold;
+			font-size: 1.2rem;
+			padding: 0.5rem 1.2rem;
+			border-radius: 5px;
+			transition: background 0.2s;
+		}
+		.nav-links a:hover {
+			background: #1a2233;
+		}
+		.container { max-width: 900px; margin: 2rem auto; padding: 2rem; background: #fff; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); }
+		.section-title { font-size: 1.3rem; margin-bottom: 1rem; color: #2d3e50; }
+		.cards { display: flex; gap: 2rem; flex-wrap: wrap; }
+		.card { flex: 1 1 250px; background: #f9fafb; border-radius: 8px; padding: 1.5rem; box-shadow: 0 1px 4px rgba(0,0,0,0.05); margin-bottom: 2rem; }
+		.card h2 { margin-top: 0; color: #1a2233; }
+		.btn { display: inline-block; margin-top: 1rem; padding: 0.5rem 1.2rem; background: #2d3e50; color: #fff; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; }
+		.btn:hover { background: #1a2233; }
+	</style>
+	<style>
+	/* Responsive Design for Mobile */
+	@media (max-width: 600px) {
+		.container {
+			max-width: 100vw;
+			padding: 0.5rem;
+			border-radius: 0;
+			box-shadow: none;
+		}
+		.navbar {
+			padding: 1.2rem 0.5rem 0.7rem 0.5rem;
+		}
+		.navbar h1 {
+			font-size: 2rem;
+		}
+		.nav-links {
+			flex-direction: column;
+			gap: 0.7rem;
+			margin-bottom: 0.7rem;
+			align-items: stretch;
+		}
+		.nav-links a {
+			font-size: 1rem;
+			padding: 0.5rem 0.7rem;
+			text-align: center;
+		}
+		.wallet-options {
+			flex-direction: column;
+			gap: 1.2rem;
+			align-items: stretch;
+		}
+		.wallet-card {
+			width: 100%;
+			min-width: unset;
+			max-width: unset;
+			padding: 1rem 0.5rem 1rem 0.5rem;
+		}
+		.wallet-card input[type="text"],
+		.wallet-card select {
+			width: 100%;
+			font-size: 1rem;
+		}
+		.wallet-btn {
+			width: 100%;
+			margin-top: 0.5rem;
+			font-size: 1rem;
+			padding: 0.6rem 0;
+		}
+		.main-section {
+			padding: 0.5rem 0;
+		}
+		.card {
+			padding: 1rem 0.5rem;
+			min-width: unset;
+			max-width: unset;
+		}
+		#referral-link {
+			width: 100%;
+			margin-bottom: 0.5rem;
+		}
+		.wallet-method {
+			padding: 1rem 0.5rem 0.7rem 0.5rem;
+		}
+		table {
+			font-size: 0.95rem;
+			word-break: break-all;
+		}
+		img {
+			max-width: 100%;
+			height: auto;
+		}
+	}
+	</style>
+</head>
+<body>
+	<!-- Auth Modal -->
+	<div id="auth-modal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.3); z-index:1000; justify-content:center; align-items:center;">
+		<div style="background:#fff; padding:2rem 2.5rem; border-radius:10px; box-shadow:0 2px 12px rgba(0,0,0,0.15); min-width:320px; position:relative;">
+			<span onclick="closeAuthModal()" style="position:absolute; top:10px; right:18px; font-size:1.5rem; cursor:pointer;">&times;</span>
+			<h2 id="auth-type" style="margin-bottom:1.2rem; color:#2d3e50;">Login</h2>
+			<input id="auth-username" type="text" placeholder="Username" style="width:100%; padding:0.7rem; margin-bottom:1rem; border-radius:6px; border:1px solid #b0bec5; font-size:1rem;">
+			<input id="auth-phone" type="text" placeholder="Phone Number (11 digits)" style="width:100%; padding:0.7rem; margin-bottom:1rem; border-radius:6px; border:1px solid #b0bec5; font-size:1rem; display:none;">
+			<input id="auth-password" type="password" placeholder="Password" style="width:100%; padding:0.7rem; margin-bottom:1.2rem; border-radius:6px; border:1px solid #b0bec5; font-size:1rem;">
+			<button id="auth-action" class="wallet-btn" style="width:100%;">Login</button>
+		</div>
+	</div>
+	<!-- Choose Auth Modal -->
+	<div id="choose-auth-modal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.3); z-index:2000; justify-content:center; align-items:center;">
+  <div style="background:#fff; padding:2rem 2.5rem; border-radius:10px; box-shadow:0 2px 12px rgba(0,0,0,0.15); min-width:320px; text-align:center;">
+    <h2 style="color:#2d3e50; margin-bottom:1.5rem;">Welcome</h2>
+    <button class="wallet-btn" style="width:100%; margin-bottom:1rem; background:#4caf50;" onclick="openAuthFromChoice('register')">Register</button>
+    <button class="wallet-btn" style="width:100%; background:#009688;" onclick="openAuthFromChoice('login')">Login</button>
+  </div>
+</div>
+	<div class="navbar">
+		<span id="auth-user" style="font-size:1.1rem; color:#fff; margin-bottom:0.5rem; display:block;"></span>
+		<div style="margin-bottom:0.7rem;">
+			<button id="login-btn" class="wallet-btn" style="background:#009688; margin-right:0.5rem;" onclick="showAuthModal('login')">Login</button>
+			<button id="register-btn" class="wallet-btn" style="background:#4caf50; margin-right:0.5rem;" onclick="showAuthModal('register')">Register</button>
+			<button id="logout-btn" class="wallet-btn" style="background:#b71c1c; display:none;" onclick="doLogout()">Logout</button>
+		</div>
+		<h1>Cash Win</h1>
+		<div class="nav-links">
+			<a href="#" onclick="showSection('home');return false;">Home</a>
+			<a href="#" onclick="showSection('wallet');return false;">Wallet</a>
+			<a href="#" onclick="showSection('tasks');return false;">Tasks</a>
+			<a href="#" onclick="showSection('plans');return false;">Plans</a>
+			<a href="#" onclick="showSection('friends');return false;">Friends</a>
+			<a href="#" onclick="showSection('support');return false;">Support</a>
+		</div>
+	</div>
+	<div class="container">
+		<div id="not-logged-in" style="display:none; text-align:center; padding:3rem 1rem;">
+			<h2 style="color:#2d3e50;">Please Login or Register to use the platform.</h2>
+		</div>
+		<div id="main-content">
+		<div id="friends" class="main-section" style="display:none; text-align:center;">
+			<div style="margin-bottom:1.5rem;">
+				<input id="referral-link" type="text" readonly style="width:70%; padding:0.7rem; border-radius:6px; border:1px solid #b0bec5; font-size:1rem;">
+				<button class="wallet-btn" style="margin-left:0.7rem; background:#009688;" onclick="copyReferral()">Copy Link</button>
+			</div>
+			<h2 style="color:#2d3e50; margin-bottom:1.2rem;">Invite Friends & Earn</h2>
+			<p style="font-size:1.1rem; color:#444; max-width:500px; margin:0 auto 1.5rem auto;">Share your unique referral link with friends. When they join using your link, you both earn rewards!</p>
+			<!-- Referral link and copy button removed as requested -->
+			<img src="https://img.freepik.com/free-vector/refer-friend-concept-illustration_114360-7892.jpg" alt="Refer a Friend" style="max-width:320px; width:100%; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,0.07);">
+		</div>
+		<div id="home" class="main-section" style="display:none; text-align:center;">
+			<h1 style="font-size:3.5rem; margin-bottom:0.5rem; background: linear-gradient(90deg, #ff9800, #ff3d00, #00bcd4, #4caf50); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; letter-spacing:2px;">Cash Win</h1>
+			<h2 style="color:#2d3e50; margin-bottom:1.5rem;">Earning Money Platform</h2>
+			<p style="font-size:1.2rem; color:#444; max-width:600px; margin:0 auto 2rem auto;">Welcome to Cash Win, your trusted platform for earning money online through smart investments, daily tasks, and exclusive rewards. Start your journey to financial growth with our secure and user-friendly system.</p>
+			<img src="https://img.freepik.com/free-vector/financial-profit-growth-illustration_33099-2137.jpg" alt="Earning" style="max-width:350px; width:100%; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,0.07); margin-bottom:2rem;">
+		</div>
+		<div id="wallet" class="main-section" style="display:none;">
+			<div class="card" style="background:transparent; box-shadow:none;">
+				<div class="wallet-section-title">Wallet</div>
+				<div style="text-align:center; margin-bottom:1.2rem;">
+				<span style="font-size:1.2rem; color:#009688; font-weight:bold;">Wallet Balance: </span>
+				<span id="wallet-balance" style="font-size:1.3rem; color:#2d3e50; font-weight:bold;">0 PKR</span>
+				</div>
+				<div id="wallet-requests" style="margin-bottom:2rem;"></div>
+				<div class="wallet-options">
+<script>
+function renderWalletRequests() {
+	if (!isLoggedIn || !userDB[currentUser]) return;
+	let html = '';
+	// Deposits
+	const deposits = userDB[currentUser].deposits || [];
+	const pendingDeposits = deposits.filter(d => d.status === 'pending');
+	const historyDeposits = deposits.filter(d => d.status !== 'pending');
+	if (pendingDeposits.length) {
+		html += '<div style="margin-bottom:1.2rem;"><b>Deposit Pending</b><ul style="list-style:none; padding:0;">';
+		pendingDeposits.forEach(d => {
+			html += `<li style='margin-bottom:0.3rem;'>${d.method} - ${d.amount} PKR - TID: ${d.tid} <span style='color:#b71c1c;'>[Pending]</span></li>`;
+		});
+		html += '</ul></div>';
+	}
+	if (historyDeposits.length) {
+		html += '<div style="margin-bottom:1.2rem;"><b>Deposit History</b><ul style="list-style:none; padding:0;">';
+		historyDeposits.slice().reverse().forEach(d => {
+			let color = d.status === 'approved' ? '#388e3c' : '#b71c1c';
+			let label = d.status === 'approved' ? 'Approved' : 'Rejected';
+			html += `<li style='margin-bottom:0.3rem;'>${d.method} - ${d.amount} PKR - TID: ${d.tid} <span style='color:${color};'>[${label}]</span></li>`;
+		});
+		html += '</ul></div>';
+	}
+	// Withdrawals
+	const withdrawals = userDB[currentUser].withdrawals || [];
+	const pendingWithdrawals = withdrawals.filter(w => w.status === 'pending');
+	const historyWithdrawals = withdrawals.filter(w => w.status !== 'pending');
+	if (pendingWithdrawals.length) {
+		html += '<div style="margin-bottom:1.2rem;"><b>Withdrawal Pending</b><ul style="list-style:none; padding:0;">';
+		pendingWithdrawals.forEach(w => {
+			html += `<li style='margin-bottom:0.3rem;'>${w.amount} PKR <span style='color:#b71c1c;'>[Pending]</span></li>`;
+		});
+		html += '</ul></div>';
+	}
+	if (historyWithdrawals.length) {
+		html += '<div style="margin-bottom:1.2rem;"><b>Withdrawal History</b><ul style="list-style:none; padding:0;">';
+		historyWithdrawals.slice().reverse().forEach(w => {
+			let color = w.status === 'approved' ? '#388e3c' : '#b71c1c';
+			let label = w.status === 'approved' ? 'Approved' : 'Rejected';
+			html += `<li style='margin-bottom:0.3rem;'>${w.amount} PKR <span style='color:${color};'>[${label}]</span></li>`;
+		});
+		html += '</ul></div>';
+	}
+	document.getElementById('wallet-requests').innerHTML = html;
+}
+// Call renderWalletRequests after login, deposit, withdraw, and on storage event
+const origUpdateWalletBalanceDisplay = updateWalletBalanceDisplay;
+updateWalletBalanceDisplay = function() {
+	origUpdateWalletBalanceDisplay();
+	renderWalletRequests();
+}
+// Also call on page load if already logged in
+if (typeof isLoggedIn !== 'undefined' && isLoggedIn) setTimeout(renderWalletRequests, 300);
+</script>
+					<!-- Deposit Option -->
+					<div class="wallet-card">
+						<h3 style="color:#ff9800; font-size:1.4rem; margin-bottom:1.2rem;">Deposit</h3>
+						<div class="wallet-method">
+							<div class="wallet-method-title">EasyPaisa</div>
+							<label for="ep-deposit-amount" style="font-weight:bold;">Deposit Amount:</label><br>
+							<select id="ep-deposit-amount" style="width:90%; padding:0.5rem; margin:0.5rem 0 1rem 0; border-radius:5px; border:1px solid #b0bec5; font-size:1rem;">
+								<option value="600">600</option>
+								<option value="1200">1200</option>
+								<option value="2400">2400</option>
+								<option value="4500">4500</option>
+								<option value="7000">7000</option>
+								<option value="10000">10000</option>
+							</select><br>
+							<span class="wallet-logo" style="display:inline-block; margin-bottom:0.7rem;">
+								<!-- Easypaisa SVG logo -->
+								<svg width="80" height="40" viewBox="0 0 120 60" fill="none" xmlns="http://www.w3.org/2000/svg">
+									<ellipse cx="60" cy="30" rx="55" ry="22" fill="#7ed957"/>
+									<text x="60" y="37" text-anchor="middle" font-size="22" font-family="Arial" fill="#fff" font-weight="bold">EP</text>
+								</svg>
+							</span>
+							<div style="margin:0.5rem 0 0.2rem 0;">Account: <span style="color:#2d3e50; font-weight:bold;">03190168997</span></div>
+							<div>Name: <span style="color:#2d3e50;">Abdul Khalid</span></div>
+							<div style="margin-top:0.7rem;">TID (11 digit):</div>
+							<input id="ep-tid" type="text" maxlength="11" placeholder="Enter 11 digit TID">
+							<button class="wallet-btn" style="margin-top:0.5rem;" onclick="submitEasypaisa()">Submit Easypaisa</button>
+						</div>
+						<div class="wallet-method">
+							<div class="wallet-method-title">JazzCash</div>
+							<label for="jc-deposit-amount" style="font-weight:bold;">Deposit Amount:</label><br>
+							<select id="jc-deposit-amount" style="width:90%; padding:0.5rem; margin:0.5rem 0 1rem 0; border-radius:5px; border:1px solid #b0bec5; font-size:1rem;">
+								<option value="600">600</option>
+								<option value="1200">1200</option>
+								<option value="2400">2400</option>
+								<option value="4500">4500</option>
+								<option value="7000">7000</option>
+								<option value="10000">10000</option>
+							</select><br>
+							<span class="wallet-logo" style="display:inline-block; margin-bottom:0.7rem;">
+								<!-- JazzCash SVG logo -->
+								<svg width="80" height="40" viewBox="0 0 120 60" fill="none" xmlns="http://www.w3.org/2000/svg">
+									<rect x="5" y="10" width="110" height="40" rx="15" fill="#ffb300"/>
+									<text x="60" y="37" text-anchor="middle" font-size="20" font-family="Arial" fill="#b71c1c" font-weight="bold">JC</text>
+								</svg>
+							</span>
+							<div style="margin:0.5rem 0 0.2rem 0;">Account: <span style="color:#2d3e50; font-weight:bold;">03188981174</span></div>
+							<div>Name: <span style="color:#2d3e50;">Abdul Khalid</span></div>
+							<div style="margin-top:0.7rem;">TID (12 digit):</div>
+							<input id="jc-tid" type="text" maxlength="12" placeholder="Enter 12 digit TID">
+							<button class="wallet-btn" style="margin-top:0.5rem; background:#ffb300; color:#b71c1c;" onclick="submitJazzcash()">Submit JazzCash</button>
+						</div>
+					</div>
+					<!-- Withdraw Option -->
+					<div class="wallet-card">
+						<h3 style="color:#4caf50; font-size:1.4rem; margin-bottom:1.2rem;">Withdraw</h3>
+						<div class="wallet-method">
+							<form onsubmit="event.preventDefault();">
+								<label for="withdraw-method" style="font-weight:bold;">Select Method:</label><br>
+								<select id="withdraw-method" style="width:90%; padding:0.5rem; margin:0.5rem 0 1rem 0; border-radius:5px; border:1px solid #b0bec5; font-size:1rem;">
+									<option value="easypaisa">Easypaisa</option>
+									<option value="jazzcash">JazzCash</option>
+								</select><br>
+								<label for="withdraw-amount" style="font-weight:bold;">Select Amount:</label><br>
+								<select id="withdraw-amount" style="width:90%; padding:0.5rem; margin:0.5rem 0 1rem 0; border-radius:5px; border:1px solid #b0bec5; font-size:1rem;">
+									<option value="300">300</option>
+									<option value="800">800</option>
+									<option value="2000">2000</option>
+									<option value="7000">7000</option>
+									<option value="15000">15000</option>
+									<option value="30000">30000</option>
+								</select><br>
+								<label for="withdraw-name" style="font-weight:bold;">Account Name:</label><br>
+								<input id="withdraw-name" type="text" maxlength="30" placeholder="Enter account holder name" style="width:90%; padding:0.5rem; margin:0.5rem 0 1rem 0; border-radius:5px; border:1px solid #b0bec5; font-size:1rem;"><br>
+								<label for="withdraw-number" style="font-weight:bold;">Account Number:</label><br>
+								<input id="withdraw-number" type="text" maxlength="11" placeholder="Enter 11 digit account number" style="width:90%; padding:0.5rem; margin:0.5rem 0 1rem 0; border-radius:5px; border:1px solid #b0bec5; font-size:1rem;"><br>
+								<button id="bind-btn" class="wallet-btn" type="button" onclick="bindAccount()" style="background:#009688;">Bind Account</button>
+								<button class="wallet-btn" type="button" onclick="submitWithdraw()" style="background:#4caf50; margin-left:1rem;">Request Withdraw</button>
+							</form>
+						</div>
+					</div>
+				</div>
+			</div>
+		</div>
+		<div id="tasks" class="main-section" style="display:none;">
+			<div class="card">
+				<h2>Tasks</h2>
+				<div id="tasks-content"></div>
+			</div>
+		</div>
+		<div id="plans" class="main-section" style="display:none;">
+			<h2 style="color:#2d3e50; margin-bottom:1.5rem; text-align:center;">Investment Plans</h2>
+			<div id="plans-content"></div>
+			<script>if(window.updatePlansSection) updatePlansSection();</script>
+		</div>
+<script>
+// Show/hide main sections
+function showSection(section) {
+	const sections = ['home','wallet','tasks','plans','friends','support'];
+	sections.forEach(s => {
+		const el = document.getElementById(s);
+		if (el) el.style.display = (s === section) ? 'block' : 'none';
+	});
+	if(section==='plans' && typeof updatePlansSection==='function') updatePlansSection();
+	if(section==='tasks' && typeof updateTaskSection==='function') updateTaskSection();
+	if(section==='friends' && typeof updateFriendsSection==='function') updateFriendsSection();
+}
+// Render plans dynamically
+function updatePlansSection() {
+	const plansDiv = document.getElementById('plans-content');
+	if (!plansDiv) return;
+	let html = '<div style="display:flex; flex-wrap:wrap; gap:2rem; justify-content:center;">';
+	// All six plans can be joined and earn
+	const planList = [600,1200,2400,4500,7000,10000];
+	planList.forEach(amount => {
+		let color, name;
+		if (amount === 600) { color = '#7ed957'; name = 'Starter'; }
+		else if (amount === 1200) { color = '#ffb300'; name = 'Basic'; }
+		else if (amount === 2400) { color = '#00bcd4'; name = 'Silver'; }
+		else if (amount === 4500) { color = '#4caf50'; name = 'Gold'; }
+		else if (amount === 7000) { color = '#ff3d00'; name = 'Platinum'; }
+		else if (amount === 10000) { color = '#b71c1c'; name = 'Diamond'; }
+		let border = color;
+		let earning = planEarnings[amount]||0;
+		let canBuy = isLoggedIn && walletBalance>=amount && (!userPlan || amount>userPlan);
+		let already = userPlan && userPlan>=amount;
+		let isActive = userPlan && userPlan === amount;
+		html += `<div class="card" style="background:linear-gradient(135deg,#e0eafc 60%,${color} 100%); border:2px solid ${border}; min-width:220px; max-width:240px; text-align:center;">`;
+		html += `<h3 style="color:${color}; font-size:2rem; margin:0.5rem 0;">${amount} PKR</h3>`;
+		html += `<p style="color:#444;">${name} Plan</p>`;
+		html += `<div style="color:#009688; font-weight:bold; margin-bottom:0.7rem;">Daily Earning: ${earning} PKR</div>`;
+		html += `<div style="margin-bottom:0.7rem;">Task: Complete 1 daily tap task</div>`;
+		if (isActive) {
+			html += `<button class=\"wallet-btn\" style=\"background:#388e3c; color:#fff; cursor:not-allowed; font-weight:bold;\" disabled>Active</button>`;
+		} else if (userPlan && amount < userPlan) {
+			html += `<button class=\"wallet-btn\" style=\"background:#bdbdbd; color:#fff; cursor:not-allowed;\" disabled>Joined</button>`;
+		} else if (!userPlan || amount > userPlan) {
+			let canJoin = isLoggedIn && walletBalance >= amount;
+			if (canJoin) {
+				html += `<button class=\"wallet-btn\" onclick=\"joinPlan(${amount})\">Join Now</button>`;
+			} else {
+				html += `<button class=\"wallet-btn\" style=\"background:#bdbdbd; color:#fff; cursor:not-allowed;\" disabled>Join Now</button>`;
+			}
+		}
+		html += `</div>`;
+	});
+	plansDiv.innerHTML = html;
+}
+// Ensure plans section updates after login/register
+const origUpdateAuthUI = updateAuthUI;
+updateAuthUI = function() {
+	origUpdateAuthUI();
+	if(typeof updatePlansSection==='function') updatePlansSection();
+}
+</script>
+		</div>
+		<div id="support" class="main-section" style="display:none;">
+			<div class="card">
+				<h2>Support</h2>
+				<p>Need help? Contact our support team for assistance.</p>
+				<a href="mailto:support@cashwin.com" class="btn">Email Support</a>
+			</div>
+		</div> <!-- end main-content -->
+		</div>
+	</div>
+</body>
+</html>
